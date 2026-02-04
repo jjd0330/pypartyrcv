@@ -8,3 +8,4 @@ from .pyrcv import *  # noqa
 from .transform import *  # noqa
 from .types import *  # noqa
 from .viz import *  # noqa
+from .party_list_stv import run_party_list_stv  # noqa
