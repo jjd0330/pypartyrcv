@@ -33,6 +33,48 @@ def _first_nonzero(ranking: List[int]) -> int:
     return 0
 
 
+def droop_quota(total_votes: int, seats: int) -> int:
+    # Q = floor(N/(S+1)) + 1
+    return (total_votes // (seats + 1)) + 1
+
+
+def ballot_group_mass(bg: BallotGroup) -> Fraction:
+    return Fraction(bg.count, 1) * bg.weight
+
+
+def compute_party_totals(ballot_groups: List[BallotGroup], num_parties: int) -> List[Fraction]:
+    """Return V[0..num_parties], where index 0 is exhausted."""
+    totals: List[Fraction] = [Fraction(0, 1) for _ in range(num_parties + 1)]
+    for bg in ballot_groups:
+        p = current_party(bg)
+        if p is None:
+            totals[0] += ballot_group_mass(bg)
+        else:
+            totals[p] += ballot_group_mass(bg)
+    return totals
+
+
+def compute_seats_and_excess(V: List[Fraction], Q: int) -> tuple[List[int], List[Fraction]]:
+    """Return (W, E) arrays aligned with V."""
+    W: List[int] = [0 for _ in range(len(V))]
+    E: List[Fraction] = [Fraction(0, 1) for _ in range(len(V))]
+    Qf = Fraction(Q, 1)
+    for i, Vi in enumerate(V):
+        if i == 0:
+            continue  # exhausted never earns seats
+        Wi = int(Vi // Qf)  # floor for Fractions
+        W[i] = Wi
+        E[i] = Vi - Qf * Wi
+    return W, E
+
+
+total_votes_int = sum(int(v) for v in race_data.votes)
+Q = droop_quota(total_votes_int, race_data.metadata.num_winners)
+
+V = compute_party_totals(ballot_groups, num_parties)
+W, E = compute_seats_and_excess(V, Q)
+
+
 def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceResult:
     """
     Party-list STV-like tabulation (still skeleton).
