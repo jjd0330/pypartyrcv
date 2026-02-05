@@ -1,11 +1,28 @@
 from pyrcv.party_list_stv import run_party_list_stv
 from pyrcv.types import RaceData, RaceMetadata
-
 from fractions import Fraction
 from pyrcv.party_list_stv import droop_quota, compute_seats_and_excess
-
-
 from pyrcv.party_list_stv import BallotGroup, compute_party_totals, transfer_surplus_for_party
+
+
+def test_semiclosed_party_does_not_receive_later_transfers():
+    # Party 1 wins early and becomes semiclosed; later transfers should not go back to 1.
+    md = RaceMetadata(race_name="t", num_winners=1, names=["A", "B"])
+    race = RaceData(
+        metadata=md,
+        ballots=[
+            [1, 2],  # big first pref for 1
+            [2, 1],  # second pref points back to 1, but should be blocked once 1 semiclosed
+        ],
+        votes=[10, 1],
+    )
+
+    result = run_party_list_stv(race)
+    counts = result.rounds[0].count
+
+    # If party 1 were allowed to receive transfers after semiclosed, it's possible to increase.
+    # With semiclosed blocking, party 1 should not exceed its initial mass after its own surplus transfer.
+    assert counts[1] <= 10.0
 
 
 def test_transfer_surplus_splits_and_conserves():

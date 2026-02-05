@@ -145,6 +145,9 @@ def transfer_surplus_for_party(
     return transferred_to
 
 
+eligible_receivers = open_parties.copy()
+
+
 
 def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceResult:
     """
@@ -173,6 +176,46 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
 
     V = compute_party_totals(ballot_groups, num_parties)
     W, E = compute_seats_and_excess(V, Q)
+    
+    num_parties = len(race_data.metadata.names)
+    open_parties: set[int] = set(range(1, num_parties + 1))
+    semiclosed: set[int] = set()
+    eliminated: set[int] = set()  # not used yet, but reserve it
+
+    processed: set[int] = set()
+
+    # Keep processing surplus for parties that have earned >=1 seats and are still open/unprocessed
+    while True:
+        # recompute totals each iteration because ballot_groups change after transfers
+        V = compute_party_totals(ballot_groups, num_parties)
+        W, E = compute_seats_and_excess(V, Q)
+
+        # find any party that has seats and is still open and not yet processed
+        candidates = [p for p in open_parties if W[p] > 0 and p not in processed]
+        if not candidates:
+            break
+
+        # choose one deterministically: smallest party index (simple for now)
+        p = min(candidates)
+
+        # transfer its surplus to currently open parties excluding itself if semiclosed blocks receipt later
+        eligible_receivers = set(open_parties)
+        eligible_receivers.discard(p)  # don't allow transferring to itself via later preferences
+
+        transfer_surplus_for_party(
+            ballot_groups=ballot_groups,
+            source_party=p,
+            V=V,
+            E=E,
+            eligible_receivers=eligible_receivers,
+        )
+
+        # after transferring its surplus once, it becomes semiclosed permanently
+        open_parties.remove(p)
+        semiclosed.add(p)
+        processed.add(p)
+
+
     # Current behavior: first-preference totals (keeps tests simple while we build machinery)
     totals: List[Fraction] = [Fraction(0, 1) for _ in range(num_parties + 1)]
     for bg in ballot_groups:
@@ -185,6 +228,14 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
     round0 = RoundResult(
         count=[float(x) for x in totals],
         elected=[],
+        eliminated=[],
+        transfers={},
+    )
+    V_final = compute_party_totals(ballot_groups, num_parties)
+
+    round0 = RoundResult(
+        count=[float(x) for x in V_final],
+        elected=[],      # we’ll fill this once we start reporting seat gains
         eliminated=[],
         transfers={},
     )
