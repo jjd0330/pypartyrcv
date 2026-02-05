@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import List, Optional, Dict
+from typing import Dict, Iterable, List, Optional, Tuple
 import random
 
 from pyrcv.types import RaceData, RaceResult, RoundResult
@@ -10,10 +10,10 @@ from pyrcv.types import RaceData, RaceResult, RoundResult
 
 @dataclass
 class BallotGroup:
-    ranking: List[int]   # ordered party preferences (1-based, no 0s)
-    count: int           # original integer count
-    weight: Fraction     # current per-ballot weight
-    current_index: int   # index into ranking list
+    ranking: List[int]
+    count: int
+    weight: Fraction
+    current_index: int
 
 
 def current_party(bg: BallotGroup) -> Optional[int]:
@@ -26,19 +26,48 @@ def advance_ballot(bg: BallotGroup) -> None:
     bg.current_index += 1
 
 
-def droop_quota(total_votes: int, seats: int) -> int:
-    # Q = floor(N/(S+1)) + 1
-    if seats <= 0:
-        raise ValueError("seats must be positive")
-    return (total_votes // (seats + 1)) + 1
-
-
 def ballot_group_mass(bg: BallotGroup) -> Fraction:
     return Fraction(bg.count, 1) * bg.weight
 
 
+def droop_quota(total_votes: int, seats: int) -> int:
+    return (total_votes // (seats + 1)) + 1
+
+
+def _clean_ranking(raw: Iterable[int], *, num_parties: int) -> List[int]:
+    seen: set[int] = set()
+    out: List[int] = []
+    for x in raw:
+        if x == 0:
+            continue
+        if not (1 <= x <= num_parties):
+            raise ValueError(f"Out-of-range party index {x} (valid 1..{num_parties}).")
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _build_ballot_groups(race_data: RaceData, *, num_parties: int) -> List[BallotGroup]:
+    buckets: Dict[Tuple[int, ...], int] = {}
+    for ranking, v in zip(race_data.ballots, race_data.votes):
+        cnt = int(v)
+        if cnt <= 0:
+            continue
+        cleaned = _clean_ranking(ranking, num_parties=num_parties)
+        if not cleaned:
+            continue
+        key = tuple(cleaned)
+        buckets[key] = buckets.get(key, 0) + cnt
+
+    return [
+        BallotGroup(ranking=list(k), count=cnt, weight=Fraction(1, 1), current_index=0)
+        for k, cnt in buckets.items()
+    ]
+
+
 def compute_party_totals(ballot_groups: List[BallotGroup], num_parties: int) -> List[Fraction]:
-    """Return V[0..num_parties], where index 0 is exhausted."""
     totals: List[Fraction] = [Fraction(0, 1) for _ in range(num_parties + 1)]
     for bg in ballot_groups:
         p = current_party(bg)
@@ -49,25 +78,18 @@ def compute_party_totals(ballot_groups: List[BallotGroup], num_parties: int) -> 
     return totals
 
 
-def compute_seats_and_excess(V: List[Fraction], Q: int) -> tuple[List[int], List[Fraction]]:
-    """Return (W, E) arrays aligned with V, using W = floor(V/Q) and E = V - QW."""
+def compute_seats_and_excess(V: List[Fraction], Q: int) -> Tuple[List[int], List[Fraction]]:
     W: List[int] = [0 for _ in range(len(V))]
     E: List[Fraction] = [Fraction(0, 1) for _ in range(len(V))]
     Qf = Fraction(Q, 1)
-    for i, Vi in enumerate(V):
-        if i == 0:
-            continue  # exhausted never earns seats
-        Wi = int(Vi // Qf)
+    for i in range(1, len(V)):
+        Wi = int(V[i] // Qf)
         W[i] = Wi
-        E[i] = Vi - Qf * Wi
+        E[i] = V[i] - Qf * Wi
     return W, E
 
 
 def advance_to_next_eligible(bg: BallotGroup, eligible: set[int]) -> Optional[int]:
-    """
-    Advance bg until it points to an eligible party, or exhaust.
-    Returns the new current party (or None if exhausted).
-    """
     while True:
         p = current_party(bg)
         if p is None:
@@ -79,31 +101,24 @@ def advance_to_next_eligible(bg: BallotGroup, eligible: set[int]) -> Optional[in
 
 def transfer_surplus_for_party(
     ballot_groups: List[BallotGroup],
+    *,
     source_party: int,
     V: List[Fraction],
-    E: List[Fraction],
+    surplus: Fraction,
     eligible_receivers: set[int],
-) -> dict[int, Fraction]:
+) -> Dict[int, Fraction]:
     """
-    Redistribute the surplus of source_party.
-
-    Transfer fraction: T = E[source]/V[source]
-    Applied to ballots currently allocated to source_party.
-
-    Mutates ballot_groups by:
-    - reducing weight on ballots that stay with source_party
-    - creating new ballot groups (same ranking, same count) that carry the transferred weight
-      and advance to next eligible receiver
-
-    Returns a dict: target_party -> transferred vote mass (Fraction), plus key 0 for exhausted if any.
+    Transfer only the provided surplus amount.
+    Uses T = surplus / V[source] applied to ballots currently on source.
+    Returns ledger target->mass (0 for exhausted).
     """
-    transferred_to: dict[int, Fraction] = {}
-    if V[source_party] == 0 or E[source_party] == 0:
-        return transferred_to
+    ledger: Dict[int, Fraction] = {}
+    if V[source_party] == 0 or surplus == 0:
+        return ledger
 
-    T = E[source_party] / V[source_party]
+    T = surplus / V[source_party]
     if T <= 0:
-        return transferred_to
+        return ledger
 
     new_groups: List[BallotGroup] = []
 
@@ -111,244 +126,178 @@ def transfer_surplus_for_party(
         if current_party(bg) != source_party:
             continue
 
-        original_weight = bg.weight
-        transfer_weight = original_weight * T
-        retained_weight = original_weight - transfer_weight
+        w0 = bg.weight
+        w_tr = w0 * T
+        w_keep = w0 - w_tr
 
-        # Retain part stays on source
-        bg.weight = retained_weight
+        bg.weight = w_keep
 
-        if transfer_weight == 0:
+        if w_tr == 0:
             continue
 
-        # Transferred part becomes its own group and advances
         bg2 = BallotGroup(
             ranking=bg.ranking,
             count=bg.count,
-            weight=transfer_weight,
+            weight=w_tr,
             current_index=bg.current_index,
         )
-        advance_ballot(bg2)  # move off the source party
+        advance_ballot(bg2)
         p2 = advance_to_next_eligible(bg2, eligible_receivers)
-
         key = 0 if p2 is None else p2
-        mass = ballot_group_mass(bg2)
-        transferred_to[key] = transferred_to.get(key, Fraction(0, 1)) + mass
 
+        m = ballot_group_mass(bg2)
+        ledger[key] = ledger.get(key, Fraction(0, 1)) + m
         new_groups.append(bg2)
 
     ballot_groups.extend(new_groups)
-    return transferred_to
-
-
-def eliminate_party_transfer(
-    ballot_groups: List[BallotGroup],
-    eliminated_party: int,
-    eligible_receivers: set[int],
-) -> dict[int, Fraction]:
-    """
-    Eliminate a party with W=0: transfer ALL its currently-held vote mass forward.
-
-    Mutates ballot_groups in-place by advancing ballot pointers off the eliminated party.
-    Returns transfer ledger (target -> mass), with key 0 for exhausted.
-    """
-    ledger: dict[int, Fraction] = {}
-    for bg in ballot_groups:
-        if current_party(bg) != eliminated_party:
-            continue
-
-        advance_ballot(bg)  # move off eliminated party
-        p2 = advance_to_next_eligible(bg, eligible_receivers)
-
-        key = 0 if p2 is None else p2
-        mass = ballot_group_mass(bg)
-        ledger[key] = ledger.get(key, Fraction(0, 1)) + mass
-
     return ledger
 
 
-def _ledger_to_round_transfers(source: int, ledger: Dict[int, Fraction]) -> Dict[int, Dict[int, float]]:
-    if not ledger:
-        return {}
-    return {source: {t: float(m) for t, m in ledger.items()}}
+def eliminate_party_and_transfer_all(
+    ballot_groups: List[BallotGroup],
+    *,
+    source_party: int,
+    eligible_receivers: set[int],
+) -> Dict[int, Fraction]:
+    ledger: Dict[int, Fraction] = {}
+    for bg in ballot_groups:
+        if current_party(bg) != source_party:
+            continue
+        advance_ballot(bg)
+        p2 = advance_to_next_eligible(bg, eligible_receivers)
+        key = 0 if p2 is None else p2
+        m = ballot_group_mass(bg)
+        ledger[key] = ledger.get(key, Fraction(0, 1)) + m
+    return ledger
+
+
+def _float_transfers_round(src_to_tgt: Dict[int, Dict[int, Fraction]]) -> Dict[int, Dict[int, float]]:
+    return {src: {t: float(m) for t, m in tmap.items()} for src, tmap in src_to_tgt.items()}
 
 
 def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceResult:
-    """
-    Party-list STV-like tabulation (full implementation).
-
-    Implemented:
-    - Voters rank parties (indices 1..N, 0 reserved for exhausted)
-    - Exact arithmetic with Fraction on ballot-group weights
-    - Droop quota Q = floor(N/(S+1)) + 1
-    - Seat-winner processing: when an OPEN party has floor(V/Q) > 0, it is assigned that many seats (capped
-      by remaining seats), then its surplus is transferred, then it becomes SEMICLOSED permanently.
-    - Semiclosed parties never receive transfers (only OPEN parties are eligible receivers).
-    - Elimination: when no open party has W>0, eliminate the open party with lowest V (ties broken deterministically)
-      and transfer all of its vote mass forward to next eligible open parties, else exhaust.
-    - Remainder seats: if seats remain after transfers/eliminations, allocate them one-by-one using:
-        1) highest residual (V - Q*seats_allocated_so_far)
-        2) highest V
-        3) highest first-round V
-        4) seeded random tie-break
-
-    Output:
-    - RaceResult.rounds is a list of RoundResult objects.
-      Each round corresponds to one action (a winner surplus transfer OR an elimination OR remainder allocation batch).
-      RoundResult.elected includes the party index repeated once per seat gained in that round.
-      RoundResult.transfers records {source_party: {target_party: transferred_mass}} for that round.
-    """
-    S = int(race_data.metadata.num_winners)
     num_parties = len(race_data.metadata.names)
+    seats_total = int(race_data.metadata.num_winners)
+    if seats_total <= 0:
+        raise ValueError("num_winners must be positive")
 
-    rng = random.Random(seed if seed is not None else 0)
+    rng = random.Random(seed)
 
-    # Build ballot groups
-    ballot_groups: List[BallotGroup] = []
-    for ranking, v in zip(race_data.ballots, race_data.votes):
-        cleaned = [c for c in ranking if c != 0]
-        if not cleaned:
-            continue
-        ballot_groups.append(
-            BallotGroup(
-                ranking=cleaned,
-                count=int(v),
-                weight=Fraction(1, 1),
-                current_index=0,
-            )
-        )
+    ballot_groups = _build_ballot_groups(race_data, num_parties=num_parties)
 
-    # Total (integer) ballots cast (used only for quota)
-    total_votes_int = sum(int(v) for v in race_data.votes)
-    if S <= 0:
-        # Degenerate: no seats to fill; still return a single round count for completeness.
-        V0 = compute_party_totals(ballot_groups, num_parties)
-        r0 = RoundResult(count=[float(x) for x in V0], elected=[], eliminated=[], transfers={})
-        return RaceResult(race_data.metadata, [r0])
-
-    Q = droop_quota(total_votes_int, S)
+    N = sum(int(v) for v in race_data.votes)
+    Q = droop_quota(N, seats_total)
     Qf = Fraction(Q, 1)
 
-    # First-round totals for tie-breaks
-    first_round = compute_party_totals(ballot_groups, num_parties)
-
-    # Party states
     open_parties: set[int] = set(range(1, num_parties + 1))
     semiclosed: set[int] = set()
     eliminated: set[int] = set()
 
-    # Seats allocated so far (index 0 unused)
-    seats_alloc: List[int] = [0 for _ in range(num_parties + 1)]
-
+    seats_won: List[int] = [0 for _ in range(num_parties + 1)]
     rounds: List[RoundResult] = []
 
-    def total_seats_allocated() -> int:
-        return sum(seats_alloc)
+    V_first = compute_party_totals(ballot_groups, num_parties)
 
-    def record_round(
-        elected_list: List[int],
-        eliminated_list: List[int],
-        transfers: Dict[int, Dict[int, float]],
-    ) -> None:
-        V_now = compute_party_totals(ballot_groups, num_parties)
+    def snapshot(*, elected: List[int], eliminated_list: List[int], transfers: Dict[int, Dict[int, Fraction]]) -> None:
+        Vnow = compute_party_totals(ballot_groups, num_parties)
         rounds.append(
             RoundResult(
-                count=[float(x) for x in V_now],
-                elected=elected_list,
+                count=[float(x) for x in Vnow],
+                elected=elected,
                 eliminated=eliminated_list,
-                transfers=transfers,
+                transfers=_float_transfers_round(transfers),
             )
         )
 
-    # Main loop: alternate winner processing and eliminations until either seats filled or no open parties remain
-    while open_parties and total_seats_allocated() < S:
+    snapshot(elected=[], eliminated_list=[], transfers={})
+
+    def seats_filled() -> int:
+        return sum(seats_won)
+
+    while open_parties and seats_filled() < seats_total:
         V = compute_party_totals(ballot_groups, num_parties)
         W_floor, E_floor = compute_seats_and_excess(V, Q)
 
-        # Any open party that meets quota (W>0) gets processed and becomes semiclosed
         winners = [p for p in open_parties if W_floor[p] > 0]
         if winners:
-            # Deterministic selection: smallest surplus first (then V, then first-round, then party index)
-            p = min(
-                winners,
-                key=lambda x: (E_floor[x], V[x], first_round[x], x),
-            )
+            # Pick a winner to process: highest W, then highest E, then highest V, then highest first-round V, then seed tie-break
+            def key(p: int) -> Tuple[int, Fraction, Fraction, Fraction, float]:
+                return (W_floor[p], E_floor[p], V[p], V_first[p], rng.random())
 
-            remaining = S - total_seats_allocated()
+            p = max(winners, key=key)
 
-            # Assign floor seats for this party, capped by remaining seats
-            desired_total_seats = min(W_floor[p], seats_alloc[p] + remaining)
-            gained = desired_total_seats - seats_alloc[p]
-            if gained < 0:
-                gained = 0
+            remaining = seats_total - seats_filled()
+            award = min(W_floor[p], remaining)
 
-            # Surplus relative to the seats we are actually assigning now
-            surplus = V[p] - Qf * desired_total_seats
+            seats_won[p] += award
+
+            # Surplus relative to awarded seats
+            surplus = V[p] - Qf * seats_won[p]
             if surplus < 0:
                 surplus = Fraction(0, 1)
 
-            # Transfer surplus to eligible OPEN parties (semiclosed excluded by definition)
             eligible_receivers = set(open_parties)
             eligible_receivers.discard(p)
 
-            E_for_call = [Fraction(0, 1) for _ in range(num_parties + 1)]
-            E_for_call[p] = surplus
-
             ledger = transfer_surplus_for_party(
-                ballot_groups=ballot_groups,
+                ballot_groups,
                 source_party=p,
                 V=V,
-                E=E_for_call,
+                surplus=surplus,
                 eligible_receivers=eligible_receivers,
             )
 
-            # Lock in state
-            seats_alloc[p] = desired_total_seats
+            # Add a self "retained" record so Sankey can show "only surplus leaves"
+            retained = V[p] - surplus
+            if retained > 0:
+                ledger[p] = ledger.get(p, Fraction(0, 1)) + retained
+
             open_parties.remove(p)
             semiclosed.add(p)
 
-            record_round(
-                elected_list=[p] * gained,
-                eliminated_list=[],
-                transfers=_ledger_to_round_transfers(p, ledger),
-            )
+            snapshot(elected=[p] * award, eliminated_list=[], transfers={p: ledger})
             continue
 
-        # No winners among open parties: eliminate the lowest-V open party (W=0 by construction here)
-        # Deterministic tie-break: lowest V, then lowest first-round V, then lowest party index
-        p_elim = min(open_parties, key=lambda x: (V[x], first_round[x], x))
+        # No winners: elimination vs remainder stop rule
+        remaining = seats_total - seats_filled()
+
+        # If eliminating would drop open parties to <= remaining seats, stop eliminations and do remainder seats
+        if len(open_parties) <= remaining:
+            break
+
+        # eliminate lowest-V open party (ties: lowest first-round, then seed)
+        def elim_key(p: int) -> Tuple[Fraction, Fraction, float]:
+            return (V[p], V_first[p], rng.random())
+
+        loser = min(list(open_parties), key=elim_key)
 
         eligible_receivers = set(open_parties)
-        eligible_receivers.discard(p_elim)
+        eligible_receivers.discard(loser)
 
-        ledger = eliminate_party_transfer(
-            ballot_groups=ballot_groups,
-            eliminated_party=p_elim,
+        ledger = eliminate_party_and_transfer_all(
+            ballot_groups,
+            source_party=loser,
             eligible_receivers=eligible_receivers,
         )
 
-        open_parties.remove(p_elim)
-        eliminated.add(p_elim)
+        open_parties.remove(loser)
+        eliminated.add(loser)
 
-        record_round(
-            elected_list=[],
-            eliminated_list=[p_elim],
-            transfers=_ledger_to_round_transfers(p_elim, ledger),
-        )
+        snapshot(elected=[], eliminated_list=[loser], transfers={loser: ledger})
 
-    # Remainder seats if still unfilled
-    remaining = S - total_seats_allocated()
-    if remaining > 0 and num_parties > 0:
+    # Remainder seats: allocate one-by-one using residual = V - Q*seats_won, and UPDATE residual each time
+    remaining = seats_total - seats_filled()
+    if remaining > 0:
         V = compute_party_totals(ballot_groups, num_parties)
-
-        # Residual votes after accounting for seats already allocated (including quota seats)
         residual: List[Fraction] = [Fraction(0, 1) for _ in range(num_parties + 1)]
         for p in range(1, num_parties + 1):
-            residual[p] = V[p] - Qf * seats_alloc[p]
+            residual[p] = V[p] - Qf * seats_won[p]
 
-        elected_remainders: List[int] = []
+        elected_batch: List[int] = []
         for _ in range(remaining):
-            candidates = list(range(1, num_parties + 1))
+            candidates = list(open_parties) if open_parties else [p for p in range(1, num_parties + 1) if p not in eliminated]
+            if not candidates:
+                break
 
             best_res = max(residual[p] for p in candidates)
             top = [p for p in candidates if residual[p] == best_res]
@@ -358,28 +307,15 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
                 top = [p for p in top if V[p] == best_V]
 
             if len(top) > 1:
-                best_fr = max(first_round[p] for p in top)
-                top = [p for p in top if first_round[p] == best_fr]
+                best_fr = max(V_first[p] for p in top)
+                top = [p for p in top if V_first[p] == best_fr]
 
-            if len(top) > 1:
-                # seeded random but reproducible
-                p_pick = rng.choice(sorted(top))
-            else:
-                p_pick = top[0]
+            pick = top[0] if len(top) == 1 else rng.choice(sorted(top))
 
-            elected_remainders.append(p_pick)
-            seats_alloc[p_pick] += 1
-            residual[p_pick] -= Qf  # consume this remainder capacity so it doesn't keep winning
+            seats_won[pick] += 1
+            residual[pick] -= Qf  # <-- CRITICAL FIX
+            elected_batch.append(pick)
 
-        record_round(
-            elected_list=elected_remainders,
-            eliminated_list=[],
-            transfers={},
-        )
-
-    # Ensure at least one round exists for downstream consumers
-    if not rounds:
-        V0 = compute_party_totals(ballot_groups, num_parties)
-        rounds = [RoundResult(count=[float(x) for x in V0], elected=[], eliminated=[], transfers={})]
+        snapshot(elected=elected_batch, eliminated_list=[], transfers={})
 
     return RaceResult(race_data.metadata, rounds)
