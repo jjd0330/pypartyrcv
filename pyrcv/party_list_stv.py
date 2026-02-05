@@ -67,6 +67,83 @@ def compute_seats_and_excess(V: List[Fraction], Q: int) -> tuple[List[int], List
         E[i] = Vi - Qf * Wi
     return W, E
 
+def advance_to_next_eligible(bg: BallotGroup, eligible: set[int]) -> Optional[int]:
+    """
+    Advance bg until it points to an eligible party, or exhaust.
+    Returns the new current party (or None if exhausted).
+    """
+    while True:
+        p = current_party(bg)
+        if p is None:
+            return None
+        if p in eligible:
+            return p
+        advance_ballot(bg)
+
+
+def transfer_surplus_for_party(
+    ballot_groups: List[BallotGroup],
+    source_party: int,
+    V: List[Fraction],
+    E: List[Fraction],
+    eligible_receivers: set[int],
+) -> dict[int, Fraction]:
+    """
+    Redistribute the surplus of source_party.
+    Uses transfer fraction T = E[source]/V[source] applied to ballots currently allocated to source_party.
+
+    Mutates ballot_groups by:
+    - reducing weight on ballots that stay with source_party
+    - creating new ballot groups (same ranking, same count) that carry the transferred weight and advance to next eligible receiver
+    Returns a dict: target_party -> transferred vote mass (Fraction), plus key 0 for exhausted if any.
+    """
+    transferred_to: dict[int, Fraction] = {}
+    if V[source_party] == 0 or E[source_party] == 0:
+        return transferred_to
+
+    T = E[source_party] / V[source_party]
+    if T <= 0:
+        return transferred_to
+
+    new_groups: List[BallotGroup] = []
+
+    for bg in ballot_groups:
+        if current_party(bg) != source_party:
+            continue
+
+        # Split this group's weight into retained and transferred components
+        original_weight = bg.weight
+        transfer_weight = original_weight * T
+        retained_weight = original_weight - transfer_weight
+
+        # Keep retained portion on the original group
+        bg.weight = retained_weight
+
+        if transfer_weight == 0:
+            continue
+
+        # Create a new group for the transferred portion
+        bg2 = BallotGroup(
+            ranking=bg.ranking,
+            count=bg.count,
+            weight=transfer_weight,
+            current_index=bg.current_index,  # start from same position, then advance
+        )
+        advance_ballot(bg2)  # move off the source party
+        p2 = advance_to_next_eligible(bg2, eligible_receivers)
+
+        if p2 is None:
+            key = 0
+        else:
+            key = p2
+
+        mass = ballot_group_mass(bg2)
+        transferred_to[key] = transferred_to.get(key, Fraction(0, 1)) + mass
+        new_groups.append(bg2)
+
+    ballot_groups.extend(new_groups)
+    return transferred_to
+
 
 
 def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceResult:
