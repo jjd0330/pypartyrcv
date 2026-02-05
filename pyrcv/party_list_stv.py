@@ -68,12 +68,6 @@ def compute_seats_and_excess(V: List[Fraction], Q: int) -> tuple[List[int], List
     return W, E
 
 
-total_votes_int = sum(int(v) for v in race_data.votes)
-Q = droop_quota(total_votes_int, race_data.metadata.num_winners)
-
-V = compute_party_totals(ballot_groups, num_parties)
-W, E = compute_seats_and_excess(V, Q)
-
 
 def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceResult:
     """
@@ -97,7 +91,11 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
                 current_index=0,
             )
         )
+    total_votes_int = sum(int(v) for v in race_data.votes)
+    Q = droop_quota(total_votes_int, race_data.metadata.num_winners)
 
+    V = compute_party_totals(ballot_groups, num_parties)
+    W, E = compute_seats_and_excess(V, Q)
     # Current behavior: first-preference totals (keeps tests simple while we build machinery)
     totals: List[Fraction] = [Fraction(0, 1) for _ in range(num_parties + 1)]
     for bg in ballot_groups:
