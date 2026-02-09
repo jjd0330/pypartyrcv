@@ -1,4 +1,5 @@
-***PyPartyRCV - JJ DeFeo***
+PyPartyRCV - JJ DeFeo
+=====
 This is a modified version of pyrcv (see below) which uses the DeFeo Ranked Party List method of voting. 
 
 It is similar to the Australian Senate which uses a form of Party List STV, however, the AU-Sen system uses a shortcut which requires a certain method of choosing candidates. 
@@ -19,7 +20,8 @@ The purpose of this statement is that I believe it is very important for (potent
 The idea(s) for this voting system, the math for the system, and the algorithms I invented for this system are all my own creation; I did not use AI until after the coding process began.
 
 
-Below is the original pyrcv README file. I am very greatful to the creators of pyrcv for having such an amazing, open source tool for RCV/STV, and all of the orgs supporting their work, and work to end regressive, 2-party systems generally so that all political jurisdictions can have representation that truly reflects the needs of their populations.
+**Below is the original pyrcv README file. I am very greatful to the creators of pyrcv for having such an amazing, open source tool for RCV/STV, and all of the orgs supporting their work, and work to end regressive, 2-party systems generally so that all political jurisdictions can have representation that truly reflects the needs of their populations.**
+
 =====
 pyrcv
 =====
