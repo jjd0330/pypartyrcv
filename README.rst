@@ -1,4 +1,4 @@
-PyPartyRCV - JJ DeFeo
+***PyPartyRCV - JJ DeFeo***
 This is a modified version of pyrcv (see below) which uses the DeFeo Ranked Party List method of voting. 
 
 It is similar to the Australian Senate which uses a form of Party List STV, however, the AU-Sen system uses a shortcut which requires a certain method of choosing candidates. 
@@ -15,7 +15,7 @@ That is particularly useful if you want to tie primary elections to local distri
 ...enabling local representation under a true proportional electoral system.
 
 
-Use Run.bat to start the webserver and open the webpage.
+***Use Run.bat to start the webserver and open the webpage.***
 
 
 AI DISCLAIMER: LLM AI, specificially ChatGPT 5.2 and Google Gemini 3 Fast, were used in development of PyPartyRCV in moderate to significant amounts in order to...
