@@ -2,31 +2,24 @@
 This is a modified version of pyrcv (see below) which uses the DeFeo Ranked Party List method of voting. 
 
 It is similar to the Australian Senate which uses a form of Party List STV, however, the AU-Sen system uses a shortcut which requires a certain method of choosing candidates. 
-The AU-Sen ballot offers either ranking parties, or ranking candidates. If you rank a party "A" as 1st and party "B" as second, behind the scenes what is actually happening is...
-...all of the candidats in party A are being ranked randomby (your actual vote (where the order is your rank, letter is party, and number is candidate "name") is: A1,A2,A3...An,B1,B2,B3...Bn) (where n is the # of candidates in the party).
+The AU-Sen ballot offers either ranking parties, or ranking candidates. If you rank a party "A" as 1st and party "B" as second, behind the scenes what is actually happening is all of the candidats in party A are being ranked randomby (your actual vote (where the order is your rank, letter is party, and number is candidate "name") is: A1,A2,A3...An,B1,B2,B3...Bn) (where n is the # of candidates in the party).
 
-My system directly uses STV on the parties, which required modification of the algorithms, since traditional STV (which pyrcv uses), operates on a threshold basis, with all of your excess...
-...votes being redistributed as soon as you reach enough for one seat (aka a win). This system uses a quota (Droop Quota), then redistributing excess votes beyond won seats for whichever party has the least excess...
-...then semi-locking that party so it can no longer recieve excess votes. Then it recounts won seats, then repeating that until there is minimized excess. 
+My system directly uses STV on the parties, which required modification of the algorithms, since traditional STV (which pyrcv uses), operates on a threshold basis, with all of your excess...votes being redistributed as soon as you reach enough for one seat (aka a win). This system uses a quota (Droop Quota), then redistributing excess votes beyond won seats for whichever party has the least excess then semi-locking that party so it can no longer recieve excess votes. Then it recounts won seats, then repeating that until there is minimized excess. 
 Then, it eliminates the party with the least votes, and redistributes those votes according to (effectively) standard STV procedures, until R=0 where R=Remaining Seats to be Allocated.
 
 This way, you can use any system of choosing candidates' order on the party list that you want.
-That is particularly useful if you want to tie primary elections to local districts in some way and order the party list based on those local results...
-...enabling local representation under a true proportional electoral system.
+That is particularly useful if you want to tie primary elections to local districts in some way and order the party list based on those local results enabling local representation under a true proportional electoral system.
 
 
 ***Use Run.bat to start the webserver and open the webpage.***
 
 
-AI DISCLAIMER: LLM AI, specificially ChatGPT 5.2 and Google Gemini 3 Fast, were used in development of PyPartyRCV in moderate to significant amounts in order to...
-...speed up the coding process, as well as correct errors in code and algorithmic logic or loopholes. The purpose of this statement is that I believe it is very important for...
-...(potential) users to know if the work they are interacting with is AI-assisted/AI-created in order to be able to provide proper informed consent to use/consume content...
-...whether that content be code, images, videos, or any other creative content.
+AI DISCLAIMER: LLM AI, specificially ChatGPT 5.2 and Google Gemini 3 Fast, were used in development of PyPartyRCV in moderate to significant amounts in order to speed up the coding process, as well as correct errors in code and algorithmic logic or loopholes. 
+The purpose of this statement is that I believe it is very important for (potential) users to know if the work they are interacting with is AI-assisted/AI-created in order to be able to provide proper informed consent to use/consume content, whether that content be code, images, videos, or any other creative thing.
 The idea(s) for this voting system, the math for the system, and the algorithms I invented for this system are all my own creation; I did not use AI until after the coding process began.
 
 
-Below is the original pyrcv README file. I am very greatful to the creators of pyrcv for having such an amazing, open source tool for RCV/STV, and all of the orgs supporting...
-...their work, and work to end regressive, 2-party systems generally so that all political jurisdictions can have representation that truly reflects the needs of their populations.
+Below is the original pyrcv README file. I am very greatful to the creators of pyrcv for having such an amazing, open source tool for RCV/STV, and all of the orgs supporting their work, and work to end regressive, 2-party systems generally so that all political jurisdictions can have representation that truly reflects the needs of their populations.
 =====
 pyrcv
 =====
