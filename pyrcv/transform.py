@@ -41,7 +41,7 @@ def parse_google_form_csv(
     :param buffer: CSV-parseable data in the format described above.
     :return: List containing an entry for each race parsed from the CSV file.
     """
-    df = pd.read_csv(buffer)
+    df = pd.read_csv(buffer, dtype=str, low_memory=False)
     race_infos = []
 
     weights = df["weight"].values if "weight" in df else None
