@@ -1,19 +1,38 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from typing import Dict, Tuple, Optional, List
-import tempfile
+from dataclasses import dataclass
+from typing import Dict, Optional, List
 import os
+import re
+import tempfile
 
 from flask import Flask, request, render_template_string
 import plotly.graph_objects as go
 
-from pyrcv.io import load_race_data_from_csv
-from pyrcv.party_list_stv import run_party_list_stv
 import pyrcv
+from pyrcv import transform
+from pyrcv.party_list_stv import run_party_list_stv
+from pyrcv.types import RaceData, RaceMetadata
 
 
 app = Flask(__name__)
+
+GENERAL_BALLOT_PREFIX = "*General Ballot*"
+LIST_BALLOT_PREFIX = "*List Ballot*"
+PARTY_TAG_PATTERN = re.compile(r"\{([^}]+)\}")
+WINNERS_PATTERN = re.compile(r"\((\d+)\s+(?:winners?|WINNERS?|Winners?)\)")
+
+
+@dataclass
+class PartyCandidateTabulation:
+    party_name: str
+    seats_won: int
+    contributing_districts: int
+    skipped_zero_vote_districts: List[str]
+    quota: float
+    race_data: RaceData
+    result: pyrcv.RaceResult
 
 
 # ----------------------------
@@ -41,6 +60,256 @@ def _droop_quota(total_votes: int, seats: int) -> int:
     return (total_votes // (seats + 1)) + 1
 
 
+def _float_fmt(x: float) -> str:
+    return f"{float(x):.6f}"
+
+
+def _elected_name_order(result, names: List[str]) -> List[str]:
+    out: List[str] = []
+    for rnd in result.rounds:
+        for idx in rnd.elected:
+            if 1 <= idx <= len(names):
+                out.append(names[idx - 1])
+    return out
+
+
+def _race_has_prefix(race: RaceData, prefix: str) -> bool:
+    return getattr(race.metadata, "race_name", "").strip().startswith(prefix)
+
+
+def _extract_party_name(race_name: str) -> Optional[str]:
+    m = PARTY_TAG_PATTERN.search(race_name)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _extract_district_label(race_name: str) -> str:
+    text = race_name.strip()
+    if text.startswith(LIST_BALLOT_PREFIX):
+        text = text[len(LIST_BALLOT_PREFIX):].strip()
+    text = PARTY_TAG_PATTERN.sub("", text).strip()
+    text = WINNERS_PATTERN.sub("", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "Unlabeled district"
+
+
+def _load_all_races(csv_path: str) -> List[RaceData]:
+    races = transform.parse_google_form_csv(csv_path)
+    if not isinstance(races, list):
+        raise TypeError("Expected parse_google_form_csv() to return a list of races.")
+    return races
+
+
+def _override_num_winners(race: RaceData, num_winners: int) -> RaceData:
+    md = race.metadata
+    md2 = RaceMetadata(
+        race_name=md.race_name,
+        num_winners=int(num_winners),
+        names=list(md.names),
+    )
+    return RaceData(metadata=md2, ballots=race.ballots, votes=race.votes)
+
+
+def _pick_largest_non_special_race(races: List[RaceData]) -> RaceData:
+    ordinary = [
+        r for r in races
+        if not _race_has_prefix(r, GENERAL_BALLOT_PREFIX)
+        and not _race_has_prefix(r, LIST_BALLOT_PREFIX)
+    ]
+    if ordinary:
+        return max(ordinary, key=lambda r: sum(int(v) for v in r.votes))
+
+    general_races = [r for r in races if _race_has_prefix(r, GENERAL_BALLOT_PREFIX)]
+    if len(general_races) == 1:
+        return general_races[0]
+
+    if len(general_races) > 1:
+        raise ValueError(
+            f"Could not identify a single fallback race to tabulate: found {len(general_races)} {GENERAL_BALLOT_PREFIX} races and no ordinary race."
+        )
+
+    raise ValueError("Could not identify a race to tabulate.")
+
+
+def _build_general_result_rows(general_race: RaceData, general_result) -> tuple[list[tuple[str, int]], str, list[tuple[str, str]]]:
+    names = list(general_race.metadata.names)
+    seats_c = _seat_counter(general_result)
+    seat_rows = [
+        (names[i - 1], int(seats_c.get(i, 0)))
+        for i in range(1, len(names) + 1)
+        if seats_c.get(i, 0) > 0
+    ]
+    last = general_result.rounds[-1].count
+    final_exhausted = _float_fmt(last[0])
+    final_rows = [(names[i - 1], _float_fmt(last[i])) for i in range(1, len(names) + 1)]
+    return seat_rows, final_exhausted, final_rows
+
+
+def _group_list_races_by_party(list_races: List[RaceData]) -> Dict[str, List[RaceData]]:
+    grouped: Dict[str, List[RaceData]] = defaultdict(list)
+    for race in list_races:
+        party_name = _extract_party_name(race.metadata.race_name)
+        if not party_name:
+            raise ValueError(f"List ballot race is missing a {{Party Name}} tag: {race.metadata.race_name}")
+        grouped[party_name].append(race)
+    return dict(grouped)
+
+
+def _build_weighted_candidate_race(
+    *,
+    party_name: str,
+    party_races: List[RaceData],
+    seats_won: int,
+) -> tuple[RaceData, int, List[str]]:
+    if seats_won <= 0:
+        raise ValueError("seats_won must be positive for candidate ordering")
+
+    candidate_pairs: List[tuple[str, str]] = []
+    for race in party_races:
+        district = _extract_district_label(race.metadata.race_name)
+        for name in race.metadata.names:
+            candidate_pairs.append((district, name))
+
+    raw_name_counts = Counter(name for _, name in candidate_pairs)
+
+    all_names: List[str] = []
+    remap_by_race: Dict[int, Dict[int, int]] = {}
+    next_idx = 1
+    pair_cursor = 0
+    for race_idx, race in enumerate(party_races):
+        mapping: Dict[int, int] = {}
+        for old_idx, name in enumerate(race.metadata.names, start=1):
+            district, raw_name = candidate_pairs[pair_cursor]
+            pair_cursor += 1
+            label = raw_name if raw_name_counts[raw_name] == 1 else f"{raw_name} [{district}]"
+            all_names.append(label)
+            mapping[old_idx] = next_idx
+            next_idx += 1
+        remap_by_race[race_idx] = mapping
+
+    combined_ballots: List[List[int]] = []
+    combined_votes: List[float] = []
+    contributing_districts = 0
+    skipped_zero_vote_districts: List[str] = []
+
+    for race_idx, race in enumerate(party_races):
+        district = _extract_district_label(race.metadata.race_name)
+        mapping = remap_by_race[race_idx]
+
+        # Only count ballots that actually cast at least one valid ranking in this
+        # party's list ballot. Blank rows from voters who selected a different party
+        # on the general ballot should not dilute this district's normalized weight.
+        valid_ballot_entries: List[tuple[List[int], float]] = []
+        district_valid_votes = 0.0
+
+        for ranking, vote_count in zip(race.ballots, race.votes):
+            mapped = [mapping[c] for c in ranking if c != 0]
+            if not mapped:
+                continue
+            vc = float(vote_count)
+            if vc <= 0:
+                continue
+            valid_ballot_entries.append((mapped, vc))
+            district_valid_votes += vc
+
+        if district_valid_votes <= 0:
+            # This district is skipped only because it contains no valid ballots for this
+            # party's list ballot. With no ballots present, there is no ballot weight to
+            # normalize and therefore no district vote mass to add to the candidate count.
+            skipped_zero_vote_districts.append(district)
+            continue
+
+        contributing_districts += 1
+
+        for mapped, vote_count in valid_ballot_entries:
+            weight = vote_count / district_valid_votes
+            combined_ballots.append(mapped)
+            combined_votes.append(weight)
+
+    if contributing_districts <= 0:
+        raise ValueError(
+            f"Party '{party_name}' won {seats_won} seat(s), but none of its list-ballot districts had any valid ballots."
+        )
+
+    race_data = RaceData(
+        metadata=RaceMetadata(
+            race_name=f"{LIST_BALLOT_PREFIX} {{{party_name}}} statewide candidate ordering",
+            num_winners=seats_won,
+            names=all_names,
+        ),
+        ballots=combined_ballots,
+        votes=combined_votes,  # type: ignore[arg-type]
+    )
+
+    # Sanity check: total vote mass should equal number of contributing districts
+    total_mass = sum(combined_votes)
+    if abs(total_mass - contributing_districts) > 1e-6:
+        raise RuntimeError(
+            f"Stage-2 vote mass mismatch: expected {contributing_districts}, got {total_mass}"
+        )
+
+    return race_data, contributing_districts, skipped_zero_vote_districts
+
+def _run_integrated_party_list_election(all_races: List[RaceData], seed: Optional[int], total_seats: int):
+    general_races = [r for r in all_races if _race_has_prefix(r, GENERAL_BALLOT_PREFIX)]
+    list_races = [r for r in all_races if _race_has_prefix(r, LIST_BALLOT_PREFIX)]
+
+    if not general_races:
+        raise ValueError(
+            f"Detected {LIST_BALLOT_PREFIX} race(s), but no {GENERAL_BALLOT_PREFIX} race was found."
+        )
+    if len(general_races) != 1:
+        raise ValueError(
+            f"Expected exactly one {GENERAL_BALLOT_PREFIX} race, but found {len(general_races)}."
+        )
+
+    general_race = _override_num_winners(general_races[0], total_seats)
+    general_result = run_party_list_stv(general_race, seed=seed)
+    general_party_seats = _seat_counter(general_result)
+    general_party_names = list(general_race.metadata.names)
+    list_races_by_party = _group_list_races_by_party(list_races)
+
+    party_tabs: List[PartyCandidateTabulation] = []
+    missing_parties: List[str] = []
+
+    for party_idx, party_name in enumerate(general_party_names, start=1):
+        seats_won = int(general_party_seats.get(party_idx, 0))
+        if seats_won <= 0:
+            continue
+
+        party_races = list_races_by_party.get(party_name, [])
+        if not party_races:
+            missing_parties.append(party_name)
+            continue
+
+        candidate_race, contributing_districts, skipped_zero_vote_districts = _build_weighted_candidate_race(
+            party_name=party_name,
+            party_races=party_races,
+            seats_won=seats_won,
+        )
+        quota = contributing_districts / float(seats_won + 1)
+        candidate_result = pyrcv.run_rcv(candidate_race, seed=seed, custom_quota=quota)
+        party_tabs.append(
+            PartyCandidateTabulation(
+                party_name=party_name,
+                seats_won=seats_won,
+                contributing_districts=contributing_districts,
+                skipped_zero_vote_districts=skipped_zero_vote_districts,
+                quota=quota,
+                race_data=candidate_race,
+                result=candidate_result,
+            )
+        )
+
+    return {
+        "general_race": general_race,
+        "general_result": general_result,
+        "party_tabs": party_tabs,
+        "missing_parties": missing_parties,
+    }
+
+
 # ----------------------------
 # Option 1: Quota-block chart
 # ----------------------------
@@ -48,9 +317,9 @@ def _droop_quota(total_votes: int, seats: int) -> int:
 def _quota_block_chart_html(
     *,
     names: List[str],
-    final_votes: List[float],   # index 0 exhausted, 1..P parties
+    final_votes: List[float],
     seats_c: Counter,
-    quota: int,
+    quota: float,
 ) -> str:
     P = len(names)
     Q = float(quota)
@@ -62,7 +331,6 @@ def _quota_block_chart_html(
     remainder = [v - l for v, l in zip(votes, locked)]
 
     fig = go.Figure()
-
     fig.add_trace(
         go.Bar(
             name="Locked (Q × seats)",
@@ -80,7 +348,6 @@ def _quota_block_chart_html(
         )
     )
 
-    # Horizontal quota lines
     max_y = max([0.0] + votes + locked)
     if quota > 0:
         kmax = int(max_y // Q) + 2
@@ -103,14 +370,13 @@ def _quota_block_chart_html(
 
     fig.update_layout(
         barmode="stack",
-        title=f"Quota blocks (Q={quota})",
+        title=f"Quota blocks (Q={quota:.6f})",
         xaxis_title="Party",
         yaxis_title="Votes",
         legend_title="Components",
         height=520,
         margin=dict(l=40, r=20, t=60, b=140),
     )
-
     return fig.to_html(include_plotlyjs="cdn", full_html=False)
 
 
@@ -129,8 +395,6 @@ def _round_sankey_html(result, names: List[str]) -> str:
         vals = []
         transfers = rnd.transfers or {}
         for src, tmap in transfers.items():
-            if not tmap:
-                continue
             s = int(src)
             for tgt, v in tmap.items():
                 t = int(tgt)
@@ -173,117 +437,6 @@ def _round_sankey_html(result, names: List[str]) -> str:
         height=520,
         margin=dict(l=20, r=220, t=60, b=20),
     )
-
-    return fig.to_html(include_plotlyjs="cdn", full_html=False)
-
-
-# ----------------------------
-# Aggregated Sankey (cleaned + spaced)
-# ----------------------------
-
-def _activity_order(result, num_parties: int) -> List[int]:
-    """
-    Returns a party ordering (1..P) roughly by "when they first mattered":
-    - first round they appear as a transfer source OR are eliminated OR are elected
-    - ties by party index
-    """
-    first_seen = {p: 10**9 for p in range(1, num_parties + 1)}
-
-    for r_i, rnd in enumerate(result.rounds):
-        # eliminated list
-        for p in (rnd.eliminated or []):
-            p = int(p)
-            if 1 <= p <= num_parties:
-                first_seen[p] = min(first_seen[p], r_i)
-
-        # elected list
-        for p in (rnd.elected or []):
-            p = int(p)
-            if 1 <= p <= num_parties:
-                first_seen[p] = min(first_seen[p], r_i)
-
-        # transfer sources
-        for src in (rnd.transfers or {}).keys():
-            p = int(src)
-            if 1 <= p <= num_parties:
-                first_seen[p] = min(first_seen[p], r_i)
-
-    return sorted(range(1, num_parties + 1), key=lambda p: (first_seen[p], p))
-
-
-def _aggregate_transfers(result, *, include_self_loops: bool) -> Dict[Tuple[int, int], float]:
-    """
-    Aggregate transfers across all rounds.
-    include_self_loops=False removes src==tgt (retained/locked mass) which otherwise creates overlapping loops.
-    """
-    agg: Dict[Tuple[int, int], float] = defaultdict(float)
-    for rnd in result.rounds:
-        for src, tmap in (rnd.transfers or {}).items():
-            s = int(src)
-            for tgt, val in (tmap or {}).items():
-                t = int(tgt)
-                if (not include_self_loops) and (s == t):
-                    continue
-                agg[(s, t)] += float(val)
-    return dict(agg)
-
-
-def _sankey_html(names: List[str], transfer_agg: Dict[Tuple[int, int], float], *, node_order: List[int]) -> str:
-    """
-    Aggregated Sankey:
-    - nodes are Exhausted (0) + parties
-    - node_order controls vertical ordering of parties to reduce crossings
-    """
-    # remap party indices to a new vertical order
-    # index 0 stays 0 (Exhausted)
-    P = len(names)
-    old_to_new = {0: 0}
-    new_to_old = {0: 0}
-
-    # party nodes start at 1
-    for new_idx, old_party in enumerate(node_order, start=1):
-        old_to_new[int(old_party)] = new_idx
-        new_to_old[new_idx] = int(old_party)
-
-    # node labels in new order
-    node_labels = ["Exhausted"] + [names[p - 1] for p in node_order]
-
-    srcs: List[int] = []
-    tgts: List[int] = []
-    vals: List[float] = []
-
-    for (src, tgt), v in transfer_agg.items():
-        if v <= 0:
-            continue
-        s = old_to_new.get(int(src))
-        t = old_to_new.get(int(tgt))
-        if s is None or t is None:
-            continue
-        srcs.append(s)
-        tgts.append(t)
-        vals.append(v)
-
-    if not vals:
-        return "<p>(No transfers recorded.)</p>"
-
-    fig = go.Figure(
-        data=[
-            go.Sankey(
-                arrangement="snap",
-                node=dict(
-                    label=node_labels,
-                    pad=28,          # more vertical spacing
-                    thickness=22,    # bigger nodes
-                ),
-                link=dict(source=srcs, target=tgts, value=vals),
-            )
-        ]
-    )
-
-    fig.update_layout(
-        height=820,  # much taller so thin flows do not overlap as badly
-        margin=dict(l=20, r=20, t=20, b=20),
-    )
     return fig.to_html(include_plotlyjs="cdn", full_html=False)
 
 
@@ -298,11 +451,11 @@ INDEX_HTML = """
     <meta charset="utf-8">
     <title>pyPartyRCV – Tabulator</title>
     <style>
-      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; max-width: 980px; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; max-width: 1100px; }
       .row { display: flex; gap: 1rem; flex-wrap: wrap; }
       .card { border: 1px solid #ddd; border-radius: 10px; padding: 1rem; }
       table { border-collapse: collapse; width: 100%; }
-      th, td { border-bottom: 1px solid #eee; padding: 0.5rem; text-align: left; }
+      th, td { border-bottom: 1px solid #eee; padding: 0.5rem; text-align: left; vertical-align: top; }
       .muted { color: #666; }
     </style>
   </head>
@@ -404,6 +557,116 @@ RESULT_HTML = """
 """
 
 
+INTEGRATED_RESULT_HTML = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Integrated Party-List Results</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; max-width: 1100px; }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { border-bottom: 1px solid #eee; padding: 0.5rem; text-align: left; vertical-align: top; }
+      .muted { color: #666; }
+      .warning { color: #8a5a00; }
+      a { color: inherit; }
+      ol { margin-top: 0.5rem; }
+    </style>
+  </head>
+  <body>
+    <p><a href="/">← back</a></p>
+    <h1>Integrated Party-List Results</h1>
+    <p class="muted">
+      Detected <b>{{ general_prefix }}</b> and <b>{{ list_prefix }}</b> races, so the file was processed in two stages:
+      the general ballot was used to allocate party seats first, and those seat totals were then carried into the candidate list-ballot counts.
+    </p>
+
+    <div class="card">
+      <h2>Stage 1 — General ballot seat allocation</h2>
+      <p class="muted">
+        General race: <b>{{ general_race_name }}</b> |
+        Total seats: <b>{{ general_seats }}</b> |
+        Vote total N: <b>{{ general_N }}</b> |
+        Quota Q: <b>{{ general_Q }}</b>
+      </p>
+      <table>
+        <tr><th>Party</th><th>Seats won</th></tr>
+        {% for name, s in general_seat_rows %}
+          <tr><td>{{ name }}</td><td>{{ s }}</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Stage 1 — Final party totals</h2>
+      <table>
+        <tr><th>Party</th><th>Votes</th></tr>
+        <tr><td>Exhausted</td><td>{{ general_final_exhausted }}</td></tr>
+        {% for name, v in general_final_rows %}
+          <tr><td>{{ name }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Stage 1 — Quota blocks</h2>
+      {{ general_quota_blocks|safe }}
+    </div>
+
+    <div class="card">
+      <h2>Stage 1 — Transfers by round</h2>
+      {{ general_sankey|safe }}
+    </div>
+
+    {% if missing_parties %}
+    <div class="card">
+      <h2>Missing list-ballot races</h2>
+      <p class="warning">
+        These parties won at least one general-election seat but had no matching {{ list_prefix }} races in the uploaded file:
+        {{ missing_parties|join(', ') }}
+      </p>
+    </div>
+    {% endif %}
+
+    {% for tab in party_tabs %}
+      <div class="card">
+        <h2>Stage 2 — {{ tab.party_name }}</h2>
+        <p class="muted">
+          Seats to fill from general ballot: <b>{{ tab.seats_won }}</b> |
+          Contributing districts D: <b>{{ tab.contributing_districts }}</b> |
+          Candidate quota Q = D / (W + 1): <b>{{ tab.quota }}</b>
+        </p>
+        {% if tab.skipped_zero_vote_districts %}
+          <p class="muted">
+            Districts skipped only because they had zero valid list-ballot votes for this party, so there was no ballot weight to normalize:
+            {{ tab.skipped_zero_vote_districts|join(', ') }}
+          </p>
+        {% endif %}
+        <p><b>Elected candidates, in order:</b></p>
+        <ol>
+          {% for name in tab.elected_order %}
+            <li>{{ name }}</li>
+          {% endfor %}
+        </ol>
+        <table>
+          <tr><th>Candidate</th><th>Votes at election</th></tr>
+          {% for name, v in tab.final_rows %}
+            <tr><td>{{ name }}</td><td>{{ v }}</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+
+      <div class="card">
+        <h3>{{ tab.party_name }} — Transfers by round</h3>
+        {{ tab.sankey|safe }}
+      </div>
+    {% endfor %}
+  </body>
+</html>
+"""
+
+
 # ----------------------------
 # Routes
 # ----------------------------
@@ -428,22 +691,92 @@ def analyze():
         path = os.path.join(td, "upload.csv")
         f.save(path)
 
-        race_data = load_race_data_from_csv(path, num_winners=seats)
+        all_races = _load_all_races(path)
+        has_list_ballot = any(_race_has_prefix(r, LIST_BALLOT_PREFIX) for r in all_races)
+
+        if has_list_ballot:
+            integrated = _run_integrated_party_list_election(all_races, seed, seats)
+            general_race = integrated["general_race"]
+            general_result = integrated["general_result"]
+            party_tabs_raw = integrated["party_tabs"]
+            missing_parties = integrated["missing_parties"]
+
+            general_names = list(general_race.metadata.names)
+            general_seat_rows, general_final_exhausted, general_final_rows = _build_general_result_rows(general_race, general_result)
+            general_last = general_result.rounds[-1].count
+            general_N = int(sum(int(v) for v in general_race.votes))
+            general_Q = _droop_quota(general_N, int(general_race.metadata.num_winners))
+            general_quota_blocks = _quota_block_chart_html(
+                names=general_names,
+                final_votes=general_last,
+                seats_c=_seat_counter(general_result),
+                quota=float(general_Q),
+            )
+            general_sankey = _round_sankey_html(general_result, general_names)
+
+            party_tabs = []
+            for tab in party_tabs_raw:
+                names = list(tab.race_data.metadata.names)
+
+                # Record each candidate's tally in the round they were first elected.
+                election_votes = {}
+                for rnd in tab.result.rounds:
+                    for cand in rnd.elected:
+                        if cand not in election_votes:
+                            election_votes[cand] = rnd.count[cand]
+
+                elected_order = _elected_name_order(tab.result, names)
+
+                rows = []
+                for i, name in enumerate(names, start=1):
+                    if i in election_votes:
+                        rows.append((name, _float_fmt(election_votes[i])))
+                    else:
+                        rows.append((name, ""))
+
+                party_tabs.append({
+                    "party_name": tab.party_name,
+                    "seats_won": tab.seats_won,
+                    "contributing_districts": tab.contributing_districts,
+                    "skipped_zero_vote_districts": tab.skipped_zero_vote_districts,
+                    "quota": _float_fmt(tab.quota),
+                    "elected_order": elected_order,
+                    "final_rows": rows,
+                    "sankey": _round_sankey_html(tab.result, names),
+                })
+
+            return render_template_string(
+                INTEGRATED_RESULT_HTML,
+                general_prefix=GENERAL_BALLOT_PREFIX,
+                list_prefix=LIST_BALLOT_PREFIX,
+                general_race_name=general_race.metadata.race_name,
+                general_seats=int(general_race.metadata.num_winners),
+                general_N=general_N,
+                general_Q=general_Q,
+                general_seat_rows=general_seat_rows,
+                general_final_exhausted=general_final_exhausted,
+                general_final_rows=general_final_rows,
+                general_quota_blocks=general_quota_blocks,
+                general_sankey=general_sankey,
+                party_tabs=party_tabs,
+                missing_parties=missing_parties,
+            )
 
         if method == "partylist":
+            race_data = _override_num_winners(_pick_largest_non_special_race(all_races), seats)
             result = run_party_list_stv(race_data, seed=seed)
         else:
+            race_data = _override_num_winners(_pick_largest_non_special_race(all_races), seats)
             result = _run_standard_stv(race_data, seed=seed)
 
         names = list(race_data.metadata.names)
         P = len(names)
-
         seats_c = _seat_counter(result)
         seat_rows = [(names[i - 1], int(seats_c.get(i, 0))) for i in range(1, P + 1) if seats_c.get(i, 0) > 0]
 
         last = result.rounds[-1].count
-        final_exhausted = f"{last[0]:.6f}"
-        final_rows = [(names[i - 1], f"{last[i]:.6f}") for i in range(1, P + 1)]
+        final_exhausted = _float_fmt(last[0])
+        final_rows = [(names[i - 1], _float_fmt(last[i])) for i in range(1, P + 1)]
 
         N = int(sum(int(v) for v in race_data.votes))
         S = int(race_data.metadata.num_winners)
@@ -453,9 +786,8 @@ def analyze():
             names=names,
             final_votes=last,
             seats_c=seats_c,
-            quota=Q,
+            quota=float(Q),
         )
-
         sankey_by_round = _round_sankey_html(result, names)
 
         return render_template_string(
