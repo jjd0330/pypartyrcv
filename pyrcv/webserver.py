@@ -154,12 +154,40 @@ def _group_list_races_by_party(list_races: List[RaceData]) -> Dict[str, List[Rac
             raise ValueError(f"List ballot race is missing a {{Party Name}} tag: {race.metadata.race_name}")
         grouped[party_name].append(race)
     return dict(grouped)
+def _district_list_vote_totals(
+    list_races: List[RaceData],
+) -> Dict[str, float]:
+    """
+    Calculate the total number of valid list-ballot votes cast in each
+    district across all parties.
 
+    Each valid voter should have a nonblank list ballot for only one party.
+    Blank list-ballot responses are not counted as votes cast.
+    """
+    totals: Dict[str, float] = defaultdict(float)
+
+    for race in list_races:
+        district = _extract_district_label(race.metadata.race_name)
+
+        for ranking, vote_count in zip(race.ballots, race.votes):
+            # An all-zero ranking represents a blank response to this
+            # party's list ballot.
+            if not any(candidate != 0 for candidate in ranking):
+                continue
+
+            vc = float(vote_count)
+            if vc <= 0:
+                continue
+
+            totals[district] += vc
+
+    return dict(totals)
 
 def _build_weighted_candidate_race(
     *,
     party_name: str,
     party_races: List[RaceData],
+    district_vote_totals: Dict[str, float],
     seats_won: int,
 ) -> tuple[RaceData, int, List[str]]:
     if seats_won <= 0:
@@ -197,33 +225,38 @@ def _build_weighted_candidate_race(
         district = _extract_district_label(race.metadata.race_name)
         mapping = remap_by_race[race_idx]
 
-        # Only count ballots that actually cast at least one valid ranking in this
-        # party's list ballot. Blank rows from voters who selected a different party
-        # on the general ballot should not dilute this district's normalized weight.
+        # Collect valid candidate rankings for this party.
         valid_ballot_entries: List[tuple[List[int], float]] = []
-        district_valid_votes = 0.0
 
         for ranking, vote_count in zip(race.ballots, race.votes):
             mapped = [mapping[c] for c in ranking if c != 0]
             if not mapped:
                 continue
+
             vc = float(vote_count)
             if vc <= 0:
                 continue
-            valid_ballot_entries.append((mapped, vc))
-            district_valid_votes += vc
 
-        if district_valid_votes <= 0:
-            # This district is skipped only because it contains no valid ballots for this
-            # party's list ballot. With no ballots present, there is no ballot weight to
-            # normalize and therefore no district vote mass to add to the candidate count.
+            valid_ballot_entries.append((mapped, vc))
+
+        # The denominator includes valid list-ballot votes for every party
+        # in this district, not merely this party's list-ballot votes.
+        district_total_votes = float(district_vote_totals.get(district, 0.0))
+
+        if district_total_votes <= 0:
+            skipped_zero_vote_districts.append(district)
+            continue
+
+        # This party contributes zero candidate weight from a district in
+        # which nobody cast a valid list ballot for this party.
+        if not valid_ballot_entries:
             skipped_zero_vote_districts.append(district)
             continue
 
         contributing_districts += 1
 
         for mapped, vote_count in valid_ballot_entries:
-            weight = vote_count / district_valid_votes
+            weight = vote_count / district_total_votes
             combined_ballots.append(mapped)
             combined_votes.append(weight)
 
@@ -242,11 +275,12 @@ def _build_weighted_candidate_race(
         votes=combined_votes,  # type: ignore[arg-type]
     )
 
-    # Sanity check: total vote mass should equal number of contributing districts
+    # Under whole-district normalization, this party's total vote mass
+    # equals its combined district vote shares, not the number of districts.
     total_mass = sum(combined_votes)
-    if abs(total_mass - contributing_districts) > 1e-6:
+    if total_mass <= 0:
         raise RuntimeError(
-            f"Stage-2 vote mass mismatch: expected {contributing_districts}, got {total_mass}"
+            f"Party '{party_name}' has no normalized candidate vote mass."
         )
 
     return race_data, contributing_districts, skipped_zero_vote_districts
@@ -254,6 +288,10 @@ def _build_weighted_candidate_race(
 def _run_integrated_party_list_election(all_races: List[RaceData], seed: Optional[int], total_seats: int):
     general_races = [r for r in all_races if _race_has_prefix(r, GENERAL_BALLOT_PREFIX)]
     list_races = [r for r in all_races if _race_has_prefix(r, LIST_BALLOT_PREFIX)]
+
+    # For every district, count all valid list ballots across every party.
+    # Each district is therefore normalized as one whole district.
+    district_vote_totals = _district_list_vote_totals(list_races)
 
     if not general_races:
         raise ValueError(
@@ -286,9 +324,13 @@ def _run_integrated_party_list_election(all_races: List[RaceData], seed: Optiona
         candidate_race, contributing_districts, skipped_zero_vote_districts = _build_weighted_candidate_race(
             party_name=party_name,
             party_races=party_races,
+            district_vote_totals=district_vote_totals,
             seats_won=seats_won,
         )
-        quota = contributing_districts / float(seats_won + 1)
+        normalized_party_vote_mass = sum(
+            float(vote_weight) for vote_weight in candidate_race.votes
+        )
+        quota = normalized_party_vote_mass / float(seats_won + 1)
         candidate_result = pyrcv.run_rcv(candidate_race, seed=seed, custom_quota=quota)
         party_tabs.append(
             PartyCandidateTabulation(
@@ -633,13 +675,15 @@ INTEGRATED_RESULT_HTML = """
       <div class="card">
         <h2>Stage 2 — {{ tab.party_name }}</h2>
         <p class="muted">
-          Seats to fill from general ballot: <b>{{ tab.seats_won }}</b> |
-          Contributing districts D: <b>{{ tab.contributing_districts }}</b> |
-          Candidate quota Q = D / (W + 1): <b>{{ tab.quota }}</b>
+            Seats to fill from general ballot: {{ tab.seats_won }} |
+            Districts with valid {{ tab.party_name }} list ballots:
+            {{ tab.contributing_districts }} |
+            Candidate quota based on normalized party vote mass:
+            {{ tab.quota }}</b>
         </p>
         {% if tab.skipped_zero_vote_districts %}
           <p class="muted">
-            Districts skipped only because they had zero valid list-ballot votes for this party, so there was no ballot weight to normalize:
+            Districts in which this party received zero valid list-ballot votes and therefore contributed zero candidate weight:
             {{ tab.skipped_zero_vote_districts|join(', ') }}
           </p>
         {% endif %}
