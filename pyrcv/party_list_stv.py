@@ -218,17 +218,46 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
         V = compute_party_totals(ballot_groups, num_parties)
         W_floor, E_floor = compute_seats_and_excess(V, Q)
 
-        winners = [p for p in open_parties if W_floor[p] > 0]
-        if winners:
-            # Pick a winner to process: highest W, then highest E, then highest V, then highest first-round V, then seed tie-break
-            def key(p: int) -> Tuple[int, Fraction, Fraction, Fraction, float]:
-                return (W_floor[p], E_floor[p], V[p], V_first[p], rng.random())
+        # A party is eligible for quota processing only if its current whole-quota
+        # entitlement exceeds the seats it has already secured.
+        #
+        # This distinction becomes necessary once semiclosed parties can be reopened.
+        # Without it, a reopened party would be awarded its existing seats again.
+        winners = [
+            p
+            for p in open_parties
+            if W_floor[p] > seats_won[p]
+        ]
 
-            p = max(winners, key=key)
+        if winners:
+            # Process the party with:
+            #   1. most whole-quota seats,
+            #   2. smallest excess,
+            #   3. largest current vote,
+            #   4. largest first-round vote,
+            #   5. seeded random tie-break.
+            #
+            # min() is used with negative values for criteria that should be
+            # maximized. Excess remains positive because it should be minimized.
+            def key(
+                p: int,
+            ) -> Tuple[int, Fraction, Fraction, Fraction, float]:
+                return (
+                    -W_floor[p],
+                    E_floor[p],
+                    -V[p],
+                    -V_first[p],
+                    rng.random(),
+                )
+
+            p = min(winners, key=key)
 
             remaining = seats_total - seats_filled()
-            award = min(W_floor[p], remaining)
 
+            # Award only the additional whole-quota seats that this party has
+            # earned since it was last processed.
+            newly_earned_seats = W_floor[p] - seats_won[p]
+            award = min(newly_earned_seats, remaining)
             seats_won[p] += award
 
             # Surplus relative to awarded seats
@@ -258,19 +287,78 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
             snapshot(elected=[p] * award, eliminated_list=[], transfers={p: ledger})
             continue
 
-        # No winners: elimination vs remainder stop rule
+        # No open party currently has an additional whole quota.
         remaining = seats_total - seats_filled()
 
-        # If eliminating would drop open parties to <= remaining seats, stop eliminations and do remainder seats
+        # First apply the ordinary stopping rule using the parties that
+        # are currently open.
+        #
+        # If the number of open parties is no greater than the number
+        # of remaining seats, stop eliminating and proceed to the
+        # remainder-seat stage.
         if len(open_parties) <= remaining:
             break
 
-        # eliminate lowest-V open party (ties: lowest first-round, then seed)
+        # If every currently open party has already secured at least
+        # one seat, then the smallest remaining party already has a
+        # seat. No further eliminations should occur.
+        #
+        # All quota surpluses have already been processed because this
+        # section is reached only when "winners" is empty.
+        seatless_open_parties = [
+            p
+            for p in open_parties
+            if seats_won[p] == 0
+        ]
+
+        if not seatless_open_parties:
+            break
+
+        # An elimination is going to occur, so reopen all semiclosed
+        # parties before choosing the loser.
+        #
+        # This allows the eliminated party's ballots to transfer to
+        # parties that previously secured quota seats.
+        if semiclosed:
+            open_parties.update(semiclosed)
+            semiclosed.clear()
+
+        # Recalculate current totals after reopening.
+        #
+        # Reopening does not itself change any ballot weights, but it
+        # changes which parties are eligible to receive transfers.
+        V = compute_party_totals(ballot_groups, num_parties)
+
+        # Only parties that have not secured a seat may be eliminated.
+        #
+        # If no seatless parties remain after reopening, the smallest
+        # surviving party has a seat, so elimination ends.
+        elimination_candidates = [
+            p
+            for p in open_parties
+            if seats_won[p] == 0
+        ]
+
+        if not elimination_candidates:
+            break
+
+        # Eliminate the lowest-current-vote seatless party.
+        #
+        # Ties are resolved by:
+        #   1. lower current vote,
+        #   2. lower first-round vote,
+        #   3. seeded random tie-break.
         def elim_key(p: int) -> Tuple[Fraction, Fraction, float]:
-            return (V[p], V_first[p], rng.random())
+            return (
+                V[p],
+                V_first[p],
+                rng.random(),
+            )
 
-        loser = min(list(open_parties), key=elim_key)
+        loser = min(elimination_candidates, key=elim_key)
 
+        # Every other open party, including reopened parties that
+        # already hold seats, may receive transferred ballots.
         eligible_receivers = set(open_parties)
         eligible_receivers.discard(loser)
 
@@ -283,7 +371,11 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
         open_parties.remove(loser)
         eliminated.add(loser)
 
-        snapshot(elected=[], eliminated_list=[loser], transfers={loser: ledger})
+        snapshot(
+            elected=[],
+            eliminated_list=[loser],
+            transfers={loser: ledger},
+        )
 
     # Remainder seats: allocate one-by-one using residual = V - Q*seats_won, and UPDATE residual each time
     remaining = seats_total - seats_filled()
@@ -295,7 +387,11 @@ def run_party_list_stv(race_data: RaceData, *, seed: int | None = None) -> RaceR
 
         elected_batch: List[int] = []
         for _ in range(remaining):
-            candidates = list(open_parties) if open_parties else [p for p in range(1, num_parties + 1) if p not in eliminated]
+            candidates = [
+                p
+                for p in range(1, num_parties + 1)
+                if p not in eliminated
+            ]
             if not candidates:
                 break
 
